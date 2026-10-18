@@ -1523,6 +1523,93 @@ jobs:
             fi
           fi
 
+      - name: 检查并修复 SukiSU SELinux 未定义符号（实验性兼容）
+        id: sukisu_selinux_compat
+        if: inputs.ksu_variant == 'SukiSU' && inputs.ksu_mode != '禁用KSU' && inputs.android_version == 'android15' && inputs.kernel_version == '6.6'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import difflib
+          import os
+          import re
+          from pathlib import Path
+          
+          root = Path(os.environ["KERNEL_ROOT"])
+          source = root / "KernelSU/kernel/feature/selinux_hide.c"
+          logs = Path(os.environ["GITHUB_WORKSPACE"]) / "build-logs"
+          logs.mkdir(parents=True, exist_ok=True)
+          if not source.is_file():
+              raise SystemExit("::error::Missing selinux_hide.c; no source was changed.")
+          original = source.read_text(encoding="utf-8")
+          (logs / "selinux_hide.before.c").write_text(original, encoding="utf-8")
+          
+          def fail(message):
+              raise SystemExit("::error::" + message + " No source was changed. See SukiSU-SELinux-Diagnostics artifact.")
+          
+          symbol = "context_struct_compute_av_fn"
+          if symbol not in original:
+              print("No context_struct_compute_av_fn reference; skipping compatibility workaround.")
+              raise SystemExit(0)
+          
+          local_definition = re.search(
+              r"\bstatic\s+(?:inline\s+)?void\s+context_struct_compute_av\s*\(([^;{}]*)\)\s*\{",
+              original,
+          )
+          if not local_definition:
+              fail("No matching local context_struct_compute_av definition.")
+          expected_parameters = [
+              "struct policydb *policydb", "struct context *scontext", "struct context *tcontext",
+              "u16 tclass", "struct av_decision *avd", "struct extended_perms *xperms",
+          ]
+          normalize = lambda value: re.sub(r"\s+", "", value)
+          if normalize(local_definition.group(1)) != normalize(",".join(expected_parameters)):
+              fail("Local function signature differs from the expected six-argument implementation.")
+          
+          declaration = re.compile(
+              r"(?m)^[ \t]*extern[ \t]+void[ \t]+context_struct_compute_av_fn\s*\([^;{}]*\)[ \t]*;[ \t]*\n?"
+          )
+          conditional = re.compile(
+              r"\bif\s*\(\s*context_struct_compute_av_fn\s*\)\s*\{\s*"
+              r"context_struct_compute_av_fn\s*\((?P<external>[^;{}]*)\)\s*;\s*"
+              r"\}\s*else\s*\{\s*context_struct_compute_av\s*\((?P<local>[^;{}]*)\)\s*;\s*\}"
+          )
+          matches = list(conditional.finditer(original))
+          if len(matches) != 1:
+              fail("Expected exactly one external/local fallback block.")
+          match = matches[0]
+          expected_arguments = "policydb,scontext,tcontext,tclass,avd,NULL"
+          if normalize(match.group("external")) != expected_arguments or normalize(match.group("local")) != expected_arguments:
+              fail("Fallback call arguments differ from the expected implementation.")
+          if local_definition.start() > match.start():
+              fail("Local implementation is not defined before the fallback call.")
+          updated, block_count = conditional.subn(
+              "context_struct_compute_av(policydb, scontext, tcontext, tclass, avd, NULL);", original
+          )
+          updated, declaration_count = declaration.subn("", updated)
+          if block_count != 1 or declaration_count != 1 or symbol in updated:
+              fail("Unexpected symbol declarations or additional references remain.")
+          patch = "".join(difflib.unified_diff(
+              original.splitlines(keepends=True), updated.splitlines(keepends=True),
+              fromfile="selinux_hide.before.c", tofile="selinux_hide.after.c",
+          ))
+          (logs / "selinux_hide.compat.patch").write_text(patch, encoding="utf-8")
+          (logs / "selinux_hide.after.c").write_text(updated, encoding="utf-8")
+          source.write_text(updated, encoding="utf-8")
+          print("Applied guarded SELinux compatibility workaround: using the existing local implementation.")
+          print(patch)
+          PY
+
+      - name: 上传 SELinux 修复诊断（仅检查失败时）
+        if: ${{ failure() && steps.sukisu_selinux_compat.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: SukiSU-SELinux-Diagnostics
+          path: build-logs/selinux_hide.*
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 9
+
       - name: 编译内核
         id: compile_kernel
         uses: nick-fields/retry@v4
